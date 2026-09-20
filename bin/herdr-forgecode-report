@@ -57,6 +57,21 @@ _resolve_binary() {
   printf '%s' ""
 }
 
+cmd_ping() {
+  # Daemon liveness probe. `herdr status server` is the canonical surface;
+  # fall back to `herdr api call daemon.ping` if the daemon is offline so the
+  # host can still see "no-daemon" rather than a hard error.
+  if ! command -v "$HERDR_BIN" >/dev/null 2>&1; then
+    printf 'no-cli\n'
+    return 0
+  fi
+  if "$HERDR_BIN" status server >/dev/null 2>&1; then
+    printf 'pong\n'
+    return 0
+  fi
+  printf 'no-daemon\n'
+}
+
 _log() {
   # Herdr-friendly log line on stderr; never on stdout (wrapper passes through).
   printf '[%s] %s\n' "$PLUGIN_NAME" "$*" >&2
@@ -84,21 +99,21 @@ _emit() {
     return 0
   fi
 
-  "$HERDR_BIN" api call pane.report_agent \
-    pane_id="$HERDR_PANE_ID" \
-    source="$SOURCE_TAG" \
-    agent="$AGENT_ID" \
-    state="$state" \
-    message="$message" >/dev/null 2>&1 || _log "pane.report_agent failed (non-fatal)"
+  # Real Herdr CLI surface (per `herdr pane report-agent --help`):
+  #   herdr pane report-agent <PANE_ID>
+  #     --source <ID> --agent <LABEL> --state <STATUS>
+  #     [--message <TEXT>] [--seq <N>]
+  #     [--agent-session-id <ID>] [--agent-session-path <PATH>]
+  "$HERDR_BIN" pane report-agent "$HERDR_PANE_ID" \
+    --source "$SOURCE_TAG" \
+    --agent "$AGENT_ID" \
+    --state "$state" \
+    --message "$message" >/dev/null 2>&1 || _log "pane.report_agent failed (non-fatal)"
 
-  "$HERDR_BIN" api call pane.report_metadata \
-    pane_id="$HERDR_PANE_ID" \
-    source="$SOURCE_TAG" \
-    agent="$AGENT_ID" \
-    title="${message:0:80}" \
-    display_agent="$DISPLAY_NAME" \
-    state_labels="$STATE_LABELS" \
-    ttl_ms=300000 >/dev/null 2>&1 || true
+  "$HERDR_BIN" pane report-metadata "$HERDR_PANE_ID" \
+    --source "$SOURCE_TAG" \
+    --title "${message:0:80}" \
+    --display-agent "$DISPLAY_NAME" >/dev/null 2>&1 || true
 
   _write_state_file "$state" "$message"
 }
@@ -189,33 +204,35 @@ case "$ACTION" in
     _emit "$state" "$message"
     ;;
 
-  forge|wrapper)
-    # Wrapper: emit working, run stock `forge`, emit final state.
+  doctor|diag)
+    # Health check: binary, herdr CLI, daemon liveness, final pane ping.
     bin="$(_resolve_binary forge)"
     if [[ -z "$bin" ]]; then
-      _msg="ForgeCode binary not installed (looked for 'forge' on PATH)"
-      _emit blocked "$_msg"
-      _log "$_msg"
-      exit 127
-    fi
-
-    _emit working "forge $*"
-
-    set +e
-    "$bin" "$@"
-    exit_code=$?
-    set -e
-
-    if [[ $exit_code -eq 0 ]]; then
-      _emit idle "forge completed successfully"
+      printf 'binary: missing (need forge on PATH)\n'
     else
-      _emit blocked "forge exited with code ${exit_code}"
+      printf 'binary: %s (%s)\n' "$bin" "$("$bin" --version 2>/dev/null | head -1 || echo 'unknown-version')"
     fi
-    exit "$exit_code"
+    if ! command -v "$HERDR_BIN" >/dev/null 2>&1; then
+      printf 'herdr:   no-cli\n'
+    else
+      printf 'herdr:   %s\n' "$(cmd_ping)"
+    fi
+    printf 'pane:    %s\n' "${HERDR_PANE_ID:-unset}"
+    printf 'agent:   %s\n' "$AGENT_ID"
     ;;
 
+  forge|wrapper)
+    _resolve_binary() { command -v "${1}.exe" >/dev/null 2>&1 && printf '%s' "${1}.exe" || command -v "$1" 2>/dev/null || printf ''; }
+    bin="$(_resolve_binary forge)"
+    if [[ -z "$bin" ]]; then
+      _log "forge binary not found on PATH; cannot run wrapper"
+      exit 127
+    fi
+    exec "$bin" "$@"
+    ;;
   *)
-    _emit unknown "ForgeCode event: ${ACTION} ${*:-}"
+    _log "no HERDR_PANE_ID set and no wrapper requested; nothing to do"
+    exit 0
     ;;
 esac
 
